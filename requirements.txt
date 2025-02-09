@@ -1,0 +1,13 @@
+uvicorn==0.34.0
+fastapi==0.115.8
+networkx==3.4.2
+numpy==2.2.2
+asyncio==3.4.3
+scipy==1.15.1
+matplotlib==3.10.0
+future==1.0.0 # For pymavlink
+lxml==5.3.0 # For pymavlink
+pymavlink==2.4.42
+cosysairsim==3.2.0
+rpc-msgpack==0.6 # For Cosys-AirSim
+opencv-python==4.11.0.86
