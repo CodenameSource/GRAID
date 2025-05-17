@@ -1,12 +1,15 @@
 import cosysairsim as airsim
+import numpy as np
 from pymavlink import mavutil
 
-from Smav.control import set_mode, takeoff, land, goto, get_location, set_param, await_armed, get_status, get_heartbeat
-from Smav.util import Waypoint
+from Smav.control import set_mode, takeoff, land, goto, get_location, set_param, await_armed, get_status, get_heartbeat, \
+    calculate_location_delta
+from Smav.util import Waypoint, geo_offset
 
 
 class Drone:
-    def __init__(self, host, port=5760, tcp=True, simulator_mode=False, simulator_address=''):
+    def __init__(self, host, port=5760, tcp=True, simulator_mode=False, simulator_address='',
+                 simulator_geo_origin=Waypoint(10, 10, 0)):
         if not tcp:
             raise NotImplementedError("Only TCP is supported")
 
@@ -15,6 +18,7 @@ class Drone:
         self.sim_mode = simulator_mode
         self.simulator_address = simulator_address
         self.simulator = None
+        self.simulator_geo_origin = simulator_geo_origin
 
         self.master = self.connect()
 
@@ -23,6 +27,8 @@ class Drone:
             self.simulator = airsim.MultirotorClient(self.simulator_address)
             self.simulator.confirmConnection()
             self.simulator.enableApiControl(True)
+            self.simulator.simSetCameraPose("0", airsim.Pose(
+                orientation_val=airsim.euler_to_quaternion(0, 0, 0)))
             return None
         master = mavutil.mavlink_connection(f'tcp:{self.host}:{self.port}')
         heartbeat = master.wait_heartbeat(timeout=30)
@@ -58,12 +64,13 @@ class Drone:
 
     def takeoff(self, alt: int):
         if self.sim_mode and self.simulator:
-            self.simulator.armDisarm(True)
+            # self.simulator.armDisarm(True)
             self.simulator.takeoffAsync().join()
 
             current_location = self.get_location()
             self.simulator.moveToGPSAsync(current_location['lat'], current_location['lon'],
-                                          current_location['alt'] + alt, 1).join()
+                                          current_location['alt'] + alt, 1, lookahead=0, adaptive_lookahead=1,
+                                          yaw_mode=airsim.YawMode(False, 0)).join()
             return
 
         takeoff(self.master, alt)
@@ -80,9 +87,32 @@ class Drone:
 
         land(self.master, lat, lon, landing_alt)
 
-    def goto(self, waypoint: Waypoint, hold_time: int = 2, velocity: int = 1):
+    def goto(self, waypoint: Waypoint, hold_time: int = 2, velocity: int = .25):
         if self.sim_mode and self.simulator:
-            self.simulator.moveToGPSAsync(waypoint.lat, waypoint.lon, waypoint.alt, velocity)
+            target_ned = geo_offset(self.simulator_geo_origin.lat, self.simulator_geo_origin.lon, waypoint.lat,
+                                    waypoint.lon)
+
+            target_ned = [target_ned[1], target_ned[0],
+                          self.simulator_geo_origin.alt - waypoint.alt]  # altitude inversed due to unreal engine weird ned, x and y are swapped
+
+            self.simulator.rotateToYawAsync(waypoint.hdg).join()
+            # self.simulator.simSetCameraPose("0", airsim.Pose(orientation_val=airsim.euler_to_quaternion(0, 0, np.deg2rad(waypoint.hdg))))
+
+            self.simulator.moveToPositionAsync(target_ned[0], target_ned[1], target_ned[2], velocity, lookahead=-1,
+                                               adaptive_lookahead=1,
+                                               yaw_mode=airsim.YawMode(False, waypoint.hdg)).join()
+
+            # current_drone_location = self.get_location()
+            # distance_to_waypoint = calculate_location_delta(waypoint.lat, waypoint.lon, current_drone_location['lat'],
+            #                                                current_drone_location['lon'])
+            ##self.simulator.moveToGPSAsync(waypoint.lat, waypoint.lon, waypoint.alt, velocity).join() A bug in airsim's moveToPath?
+
+            # while distance_to_waypoint > velocity * 2:
+            #    sleep(hold_time)
+            #    self.simulator.moveToGPSAsync(waypoint.lat, waypoint.lon, waypoint.alt, velocity/2).join()
+            #    current_drone_location = self.get_location()
+            #    distance_to_waypoint = calculate_location_delta(waypoint.lat, waypoint.lon, current_drone_location['lat'], current_drone_location['lon'])
+
             return
         goto(self.master, waypoint.lat, waypoint.lon, waypoint.alt, hold_time=hold_time)
 
@@ -90,7 +120,7 @@ class Drone:
         if self.sim_mode and self.simulator:
             vehicle_state = self.simulator.getMultirotorState()
             gps_data = vehicle_state.gps_location
-            hdg = vehicle_state.rc_data.yaw
+            hdg = np.rad2deg(airsim.quaternion_to_euler_angles(vehicle_state.kinematics_estimated.orientation)[2])
             relative_alt = vehicle_state.kinematics_estimated.position.z_val
             linear_velocity = vehicle_state.kinematics_estimated.linear_velocity
 
@@ -99,6 +129,9 @@ class Drone:
                     'vz': linear_velocity.z_val, 'hdg': hdg}
 
         return get_location(self.master)
+
+    def get_simulator(self) -> airsim.MultirotorClient:
+        return self.simulator
 
     def get_status(self):
         return get_status(self.master)
