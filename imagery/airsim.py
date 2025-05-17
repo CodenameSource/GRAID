@@ -28,6 +28,7 @@ def collect_image_airsim(client: airsim.MultirotorClient, camera_name, image_typ
     if image_type == airsim.ImageType.DepthPerspective:
         image_data = np.array(response.image_data_float, dtype=np.float32)
         image_data = image_data.reshape(response.height, response.width)
+        image_data = image_data.clip(0, 20)
     else:
         image_data = np.frombuffer(response.image_data_uint8, dtype=np.uint8)
         image_data = image_data.reshape(response.height, response.width, 3)

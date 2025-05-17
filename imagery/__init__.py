@@ -1,1 +1,2 @@
-from drone_extended import DroneExtended
+from .drone_extended import DroneExtended
+from .image_config import ImageConfig, ImageStreamsConfig

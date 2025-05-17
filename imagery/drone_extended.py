@@ -1,11 +1,14 @@
-from airsim import collect_image_airsim
-from create_depth_map import compute_stereo_depth_map
-from estimate_depth_map import estimate_depth_map
-from udp import collect_image_from_udp_stream
-from ..Smav import Drone
-from ..connection_config import ConnectionConfig
-from ..observation_grid import ObservationGrid
+import cv2
 
+from .airsim import collect_image_airsim
+from .create_depth_map import compute_stereo_depth_map
+# from .estimate_depth_map import estimate_depth_map
+from .udp import collect_image_from_udp_stream
+from Smav import Drone
+from imagery.connection_config import ConnectionConfig
+from observation_grid import ObservationGrid
+
+estimate_depth_map = ""
 
 class DroneExtended(Drone):
     def __init__(self, connection_config: ConnectionConfig, origin_grid: ObservationGrid = None,
@@ -34,21 +37,21 @@ class DroneExtended(Drone):
 
         if self.sim_mode:
             for stream in self.image_streams.image_configs:
-                if stream.image_type == "stereo":
+                if stream.img_type == "stereo":
                     if len(stream.endpoint) != 2:
                         raise ValueError("Stereo image stream requires exactly two endpoints")
 
-                    image1 = collect_image_airsim(self.simulator, stream.endpoint[0], stream.image_type)
-                    image2 = collect_image_airsim(self.simulator, stream.endpoint[1], stream.image_type)
+                    image1 = collect_image_airsim(self.simulator, stream.endpoint[0], stream.img_type)
+                    image2 = collect_image_airsim(self.simulator, stream.endpoint[1], stream.img_type)
 
                     images.append({"config": stream, "images": [image1, image2]})
                 else:
-                    image = collect_image_airsim(self.simulator, stream.endpoint, stream.image_type)
+                    image = collect_image_airsim(self.simulator, stream.endpoint, stream.img_type)
 
                     images.append({"config": stream, "images": [image]})
         else:
             for stream in self.image_streams.image_configs:
-                if stream.image_type == "stereo":
+                if stream.img_type == "stereo":
                     if len(stream.endpoint) != 2:
                         raise ValueError("Stereo image stream requires exactly two endpoints")
 
@@ -72,6 +75,8 @@ class DroneExtended(Drone):
                     image = collect_image_from_udp_stream(port, stream.resolution[0], stream.resolution[1])
                     images.append({"config": stream, "images": [image]})
 
+        return images
+
     def get_depth_images(self):
         disparity_algorithm = self.disparity_algorithm
         depth_images = []
@@ -80,19 +85,19 @@ class DroneExtended(Drone):
             image_config = image["config"]
             image_data = image["images"]
 
-            if image_config.image_type == "stereo":
+            if image_config.img_type == "stereo":
                 depth_map = self.compute_stereo_depth_map(image, disparity_algorithm)
                 depth_images.append({"config": image_config, "images": [depth_map]})
-            elif image_config.image_type == "depth":
+            elif image_config.img_type == "depth":
                 depth_images.append({"config": image_config, "images": image_data})
-            elif image_config.image_type == "rgb":
+            elif image_config.img_type == "rgb":
                 estimated_depth_map = self.estimate_depth_map(image)
                 if estimated_depth_map is None:
                     raise ValueError("Error estimating depth map")
 
                 depth_images.append({"config": image_config, "images": [estimated_depth_map]})
             else:
-                print(f"Unsupported image type: {image_config.image_type}, skipping...")
+                print(f"Unsupported image type: {image_config.img_type}, skipping...")
 
         return depth_images
 
