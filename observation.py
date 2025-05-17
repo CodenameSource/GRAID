@@ -1,3 +1,5 @@
+import math
+
 import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
@@ -62,7 +64,7 @@ class ObservationGraph:
         graph = nx.Graph()
 
         # Iterate through each depth level
-        for depth in range(1, depth_nodes + 1):
+        for depth in range(depth_nodes + 1):
             # Current depth in meters
             current_depth_m = depth * self.node_spacing
             # Apply a non-linear scaling to the FOV expansion with depth
@@ -101,7 +103,7 @@ class ObservationGraph:
         - graph: The NetworkX graph to rotate.
         - angle_degrees: The rotation angle in degrees.
         """
-        self.rotate_graph(self.graph, angle_degrees, origin=self.origin)
+        self.rotate_graph(self.graph, angle_degrees, origin=self.origin, node_spacing=self.node_spacing)
 
     def width_at_depth(self, depth):
         """
@@ -181,9 +183,6 @@ class ObservationGraph:
         if target_node in self.graph:
             # Mark the node as a target (e.g., occupancy = 3)
             self.graph.nodes[target_node]['occupancy'] = 128
-            print(f"Target point placed at {target_node} (Forward: {forward_m:.2f}m, Right: {right_m:.2f}m)")
-        else:
-            print(f"Target point {target_node} is outside the graph bounds.")
 
         return target_node
 
@@ -215,7 +214,7 @@ class ObservationGraph:
             for x in range(x_start, x_end + 1):
                 node_id = (depth, x)
                 if node_id in self.graph:
-                    if vertical_bitmap is not None:
+                    if vertical_bitmap is not None and depth_level is not None:
                         if vertical_bitmap & depth_level[1]:
                             self.graph.nodes[node_id]['occupancy'] |= 2
                         if vertical_bitmap & depth_level[2]:
@@ -223,35 +222,67 @@ class ObservationGraph:
                         self.graph.nodes[node_id]['vertical_bitmap'] |= vertical_bitmap
                     self.graph.nodes[node_id]['occupancy'] |= 1  # Set as obstacle
 
-        # Step 2: Calculate occlusion for nodes behind the entire obstacle range
-        self.apply_occlusion(depth_start, depth_end, x_start, x_end)
-
-    def apply_occlusion(self, depth_start, depth_end, x_start, x_end):
+    def apply_occlusion(self) -> None:
         """
-        Marks nodes behind a specified obstacle range as occluded based on FOV and obstacle position.
-
-        Parameters:
-        - depth_start, depth_end: Depth range of the obstacle nodes.
-        - x_start, x_end: X-coordinate range of the obstacle nodes.
+        For every node marked as an obstacle (occupancy & 1 == 1),
+        cast a “shadow” behind it by marking all graph nodes
+        that fall within its angular span as occluded (occupancy = 256),
+        as seen from the origin node (0, 0).
         """
-        # Calculate the angles for the left and right bounds of the obstacle
-        left_angle = np.arctan2((x_start * self.node_spacing), (depth_start * self.node_spacing))
-        right_angle = np.arctan2((x_end * self.node_spacing), (depth_start * self.node_spacing))
+        spacing = self.node_spacing
+        max_depth_idx = int(self.max_depth_m / spacing)
 
-        # Step through each depth level behind the obstacle range
-        for depth in range(depth_end + 1, int(self.max_depth_m / self.node_spacing) + 1):
-            # Calculate the depth in meters
-            depth_m = depth * self.node_spacing
+        # 1) Gather all obstacle nodes
+        obstacles = [
+            (d, x)
+            for (d, x), attrs in self.graph.nodes(data=True)
+            if attrs.get('occupancy', 0) & 1
+        ]
+        if not obstacles:
+            return
 
-            # Calculate the occluded x-range at this depth
-            x_occluded_min = int((np.tan(left_angle) * depth_m) / self.node_spacing)
-            x_occluded_max = int((np.tan(right_angle) * depth_m) / self.node_spacing)
+        # 2) Precompute horizontal node‐ranges for each depth
+        depth_borders: dict[int, tuple[int, int]] = {}
+        for depth in range(max_depth_idx + 1):
+            xs = [x for (d, x) in self.graph.nodes if d == depth]
+            if xs:
+                depth_borders[depth] = (min(xs), max(xs))
 
-            # Iterate over the nodes in the occluded range and set them as occluded
-            for x in range(x_occluded_min, x_occluded_max + 1):
-                node_id = (depth, x)
-                if node_id in self.graph and self.graph.nodes[node_id].get('occupancy', 0) == 0:
-                    self.graph.nodes[node_id]['occupancy'] = 256  # Set as occluded
+        # 3) Build occlusion cones (left/right angles) for each obstacle
+        cones: list[tuple[int, float, float]] = []
+        half_w = spacing / 2.0
+        for depth, x in obstacles:
+            z = depth * spacing
+            x_center = x * spacing
+            x_min = x_center - half_w
+            x_max = x_center + half_w
+
+            left_ang = math.atan2(x_min, z)
+            right_ang = math.atan2(x_max, z)
+            if left_ang > right_ang:
+                left_ang, right_ang = right_ang, left_ang
+
+            cones.append((depth, left_ang, right_ang))
+
+        # 4) For each cone, sweep depths beyond the obstacle
+        for start_depth, left_ang, right_ang in cones:
+            for d in range(start_depth + 1, max_depth_idx + 1):
+                if d not in depth_borders:
+                    continue
+
+                z = d * spacing
+                # compute fractional x‐indices covered at this depth
+                x_min_f = math.tan(left_ang) * z / spacing
+                x_max_f = math.tan(right_ang) * z / spacing
+
+                x_lo = max(math.floor(x_min_f), depth_borders[d][0])
+                x_hi = min(math.ceil(x_max_f), depth_borders[d][1])
+
+                # mark those nodes as occluded if currently empty
+                for x_idx in range(x_lo, x_hi + 1):
+                    node = (d, x_idx)
+                    if node in self.graph.nodes and self.graph.nodes[node].get('occupancy', 0) == 0:
+                        self.graph.nodes[node]['occupancy'] = 256
 
     def draw_graph(self):
         """
@@ -279,10 +310,21 @@ class ObservationGraph:
         plt.xlabel("Width (m)")
         plt.ylabel("Depth (m)")
         # plt.gca().invert_yaxis()  # Invert y-axis for better visualization
-        plt.show()
+        plt.savefig("observation_graph.png")
 
     @staticmethod
-    def rotate_graph(graph, rotation_degrees, origin=(0, 0)):
+    def rotate_graph(graph, rotation_degrees, origin=(0, 0), node_spacing=0.2):
+        if rotation_degrees == 0:
+            new_positions = {}
+            for node, (x, y) in nx.get_node_attributes(graph, 'pos').items():
+                x_rotated = x + origin[0]
+                y_rotated = y + origin[1]
+
+                new_positions[node] = (x_rotated, y_rotated)
+
+            nx.set_node_attributes(graph, new_positions, 'pos')
+            return graph
+
         angle_radians = np.radians(rotation_degrees)
         cos_angle = np.cos(angle_radians)
         sin_angle = np.sin(angle_radians)
@@ -290,9 +332,11 @@ class ObservationGraph:
         new_positions = {}
         for node, (x, y) in nx.get_node_attributes(graph, 'pos').items():
             x_shifted, y_shifted = x, y
-            x_rotated = (x_shifted * cos_angle - y_shifted * sin_angle) + origin[0]
-            y_rotated = (x_shifted * sin_angle + y_shifted * cos_angle) + origin[1]
+            x_rotated = (x_shifted * cos_angle - y_shifted * sin_angle) + origin[1]
+            y_rotated = (x_shifted * sin_angle + y_shifted * cos_angle) + origin[0]
 
             new_positions[node] = (x_rotated, y_rotated)
 
         nx.set_node_attributes(graph, new_positions, 'pos')
+
+        return graph
