@@ -27,6 +27,7 @@ class ObservationSpace:
             self,
             grid_size: int,
             node_spacing: float,
+            proximity_threshold_merging: float = .1,
             grids: List[ObservationGrid] = None,
             geo_origin: Dict[str, float] = None,
             heading_origin: float = 0,
@@ -36,12 +37,20 @@ class ObservationSpace:
     ):
         self.grid_size = grid_size
         self.node_spacing = node_spacing
+        self.proximity_threshold_merging = proximity_threshold_merging
         self.grids = grids or []
         self.geo_origin = geo_origin
         self.heading_origin = heading_origin
+        self.altitude_origin = drone.get_location()['alt']
         self.drone = drone
         self.mission_name = mission_name
         self.mission_metadata = mission_metadata or {}
+        self.last_drone_location = None
+
+    def drone_location(self):
+        self.last_drone_location = self.drone.get_location()
+
+        return self.last_drone_location
 
     def drone_position(self):
         """
@@ -50,7 +59,7 @@ class ObservationSpace:
         Returns:
         - Tuple[float, float]: The drone position.
         """
-        drone_location = self.drone.get_location()
+        drone_location = self.last_drone_location
         drone_geo_pos = {"lat": drone_location["lat"], "lon": drone_location["lon"]}
 
         if self.geo_origin:
@@ -73,18 +82,28 @@ class ObservationSpace:
         Args:
         - observation (Any): The observation to add.
         """
+
+        def round_pos(pos: tuple) -> tuple:
+            return round(pos[0], 2), round(pos[1], 2)
+
         grids = self.map_observation(observation)
+        observation.rotate_obs_graph(-observation.rotation[1])
         if grids:
+            obs_pos = [round_pos(observation.graph.nodes[node]['pos']) for node in observation.graph.nodes]
             for grid in grids:
+                grid_pos = [round_pos(grid.graph.nodes[node]['pos']) for node in grid.graph.nodes]
+                cut_pos = [node for node in obs_pos if node not in grid_pos]
                 grid.add_observation(observation)
         else:
-            origins = self.map_grid_origins(observation)
+            raise Exception("No grids mapped for this observation. This should not happen!")
+            # origins = self.map_grid_origins(observation)
 
-            for origin in origins:
-                geo_origin = self.geo_compute(self.geo_origin["lat"], self.geo_origin["lon"], origin[0], origin[1])
-                new_grid = ObservationGrid(self.grid_size, self.node_spacing, origin=origin, geo_origin=geo_origin)
-                new_grid.add_observation(observation)
-                self.grids.append(new_grid)
+    #
+    # for origin in origins:
+    #    geo_origin = self.geo_compute(self.geo_origin["lat"], self.geo_origin["lon"], origin[0], origin[1])
+    #    new_grid = ObservationGrid(self.grid_size, self.node_spacing, origin=origin, geo_origin=geo_origin)
+    #    new_grid.add_observation(observation)
+    #    self.grids.append(new_grid)
 
     def map_grid_origins(self, observation: ObservationGraph) -> [ObservationGrid]:
         """
@@ -98,11 +117,14 @@ class ObservationSpace:
         """
 
         def map_origin(position):
-            x_grids_index = int(position[0] / int(self.grid_size / 2))
-            y_grids_index = position[1] / self.grid_size
+            x_grids_index = math.floor(position[0] / int((self.grid_size * self.node_spacing) / 2))
+            y_grids_index = math.floor(position[1] / int(self.grid_size * self.node_spacing))
 
-            return x_grids_index * (self.grid_size / self.node_spacing), y_grids_index * (
-                    self.grid_size / self.node_spacing)
+            if position[0] < 0:
+                x_grids_index += 1
+
+            return x_grids_index * (self.grid_size * self.node_spacing), y_grids_index * (
+                    self.grid_size * self.node_spacing)
 
         temp_graph = observation.rotate_graph(observation.graph.copy(), observation.rotation[1] - self.heading_origin,
                                               observation.origin)
@@ -127,7 +149,31 @@ class ObservationSpace:
         Returns:
         - ObservationGrid: The grid containing the observation.
         """
-        return [grid for grid in self.grids if grid.is_relative_point_in_grid(observation.origin)]
+        grid_origins = self.map_grid_origins(observation)
+        mapped_grids = []
+
+        for origin in grid_origins:
+            origin_mapped = False
+            for grid in self.grids:
+                if grid.origin == origin:
+                    mapped_grids.append(grid)
+                    origin_mapped = True
+
+            if not origin_mapped:
+                geo_origin = self.geo_compute(self.geo_origin["lat"], self.geo_origin["lon"], origin[0], origin[1])
+                new_grid = ObservationGrid(self.grid_size, self.node_spacing, origin=origin, geo_origin=geo_origin,
+                                           proximity_threshold_merging=self.proximity_threshold_merging)
+                self.grids.append(new_grid)
+                mapped_grids.append(new_grid)
+
+        return mapped_grids
+
+    def snap_to_node_spacing(self, position):
+        return self.__snap_to_node_spacing(position, self.node_spacing)
+
+    @staticmethod
+    def __snap_to_node_spacing(position, node_spacing):
+        return round(position[0] / node_spacing) * node_spacing, round(position[1] / node_spacing) * node_spacing
 
     @staticmethod
     def geo_offset(lat1, lon1, lat2, lon2):
@@ -141,6 +187,13 @@ class ObservationSpace:
         :param lon2: Longitude of the destination point (degrees)
         :return: (forward, right) distances in meters
         """
+        # TODO: Remove and implement more permanent fix
+        lat1 = round(lat1, 8)
+        lat2 = round(lat2, 8)
+
+        lon1 = round(lon1, 8)
+        lon2 = round(lon2, 8)
+
         # Earth radius in meters
         R = 6378137.0
 
@@ -169,22 +222,22 @@ class ObservationSpace:
         :param right: Right offset in meters
         :return: (lat2, lon2) destination point in degrees
         """
-        # Earth radius in meters
+        # Earth radius in meters (WGS84)
         R = 6378137.0
 
         # Convert degrees to radians
-        lat1, lon1 = map(radians, [lat1, lon1])
+        lat1_rad, lon1_rad = map(math.radians, [lat1, lon1])
 
-        # Compute the destination point
-        lat2 = lat1 + forward / R
-        lon2 = lon1 + right / (R * cos(lat1))
+        # Compute the destination point in radians
+        lat2_rad = lat1_rad + forward / R
+        lon2_rad = lon1_rad + right / (R * math.cos(lat1_rad))
 
-        # Convert radians to degrees
-        lat2, lon2 = map(radians, [lat2, lon2])
+        # Convert radians back to degrees
+        lat2, lon2 = map(math.degrees, [lat2_rad, lon2_rad])
 
         return lat2, lon2
 
-    def get_working_grid(self, source_point, target_point) -> (int, ObservationGrid):
+    def get_working_grid(self, source_point, target_point, working_grid_padding=5) -> (int, ObservationGrid):
         """
         Get the working grid for the source and target points.
 
@@ -202,10 +255,12 @@ class ObservationSpace:
                 return False, grid
 
         return True, ObservationSpace._get_merged_grid(source_point, target_point, grids, self.grid_size,
-                                                       self.node_spacing)
+                                                       self.node_spacing, working_grid_padding,
+                                                       self.proximity_threshold_merging)
 
     @staticmethod
-    def _get_merged_grid(source_point, target_point, grids, grid_size, node_spacing, padding=5) -> (
+    def _get_merged_grid(source_point, target_point, grids, grid_size, node_spacing, padding=5,
+                         proximity_threshold_merging=.1) -> (
     int, ObservationGrid):
         def get_chunk_borders(target_point, padding):
             """
@@ -213,10 +268,10 @@ class ObservationSpace:
             """
 
             chunk_borders = {
-                "top": target_point[1] + padding,
-                "bottom": target_point[1] - padding,
-                "left": target_point[0] - padding,
-                "right": target_point[0] + padding
+                "top": round(target_point[1], 1) + padding,
+                "bottom": round(target_point[1], 1) - padding,
+                "left": round(target_point[0], 1) - padding,
+                "right": round(target_point[0], 1) + padding
             }
 
             return chunk_borders
@@ -245,7 +300,7 @@ class ObservationSpace:
 
         distance = point_distance(source_point, target_point)
 
-        if distance + 2 * padding < source_point_grid.node_spacing * source_point_grid.grid_size:
+        if distance + 2 * padding > source_point_grid.node_spacing * source_point_grid.grid_size:  #Return no merged grid if the distance between the points is too large. Done to keep the size of the grids standartised
             return None
 
         source_point_chunk = get_chunk_borders(source_point, padding)
@@ -257,14 +312,14 @@ class ObservationSpace:
         working_grid_borders["right"] = max(source_point_chunk["right"], target_point_chunk["right"])
 
         origin = (
-            working_grid_borders["left"] + int((working_grid_borders["right"] - working_grid_borders["left"]) / 2),
-            working_grid_borders["top"])
+            ObservationSpace.__snap_to_node_spacing((working_grid_borders["left"] + (
+                        (working_grid_borders["right"] - working_grid_borders["left"]) / 2), 0), node_spacing)[1],
+            working_grid_borders["bottom"])
 
-        working_grid = ObservationGrid(grid_size, node_spacing, origin=origin, proximity_threshold_merging=.5)
+        working_grid = ObservationGrid(grid_size, node_spacing, origin=origin,
+                                       proximity_threshold_merging=proximity_threshold_merging)
 
         for grid in grids:
-            if working_grid_borders["left"] <= grid.origin[0] <= working_grid_borders["right"] and \
-                    working_grid_borders["bottom"] <= grid.origin[1] <= working_grid_borders["top"]:
-                copy_grid(grid, working_grid)
+            working_grid = copy_grid(grid, working_grid)  #TODO: Check for overlapping positions here
 
         return working_grid
