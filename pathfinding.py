@@ -1,88 +1,145 @@
 import networkx as nx
 import numpy as np
+import matplotlib.pyplot as plt
 
 
-def find_path(graph, start_node, target_node, avoid_occlusion=False, padding_distance=1, mode="avoid_all"):
+def draw_graph(graph, special_nodes=[], savename="observation_graph.png"):
     """
-    Finds two paths in the graph:
-    1. Shortest path avoiding all obstacles.
-    2. Shortest path avoiding only "red" obstacles.
+    Draws the 2D depth graph with curved field of view.
+    Nodes are colored based on occupancy:
+    - Blue for empty (value 0)
+    - Red for obstacle (value 1)
+    - Yellow for unknown (value 2)
+    """
+    # Get positions for plotting
+    positions = nx.get_node_attributes(graph, 'pos')
 
-    Parameters:
-    - graph (ObsGraph): The obstacle graph.
-    - start_node: The starting node (depth, x).
-    - target_node: The target node (depth, x).
-    - padding_distance: Minimum distance (in nodes) to maintain from obstacles.
+    # Get the 'value' attribute for each node to determine colors
+    node_values = nx.get_node_attributes(graph, 'occupancy')
+    node_colors = [
+        'purple' if node in special_nodes else
+        'blue' if node_values.get(node, 0) == 0 else
+        'red' if node_values.get(node, 0) == 1 else
+        'yellow' for node in graph.nodes
+    ]
 
-    Returns:
-    - dict: Contains:
-        - "path_all": Path avoiding all obstacles.
-        - "path_red": Path avoiding only "red" obstacles.
-        - "expanded_obstacles_all": List of padded obstacle nodes for all obstacles.
-        - "expanded_obstacles_red": List of padded obstacle nodes for red obstacles.
+    # Plot the graph
+    plt.figure(figsize=(12, 10))
+    nx.draw(graph, pos=positions, node_size=5, node_color=node_colors, with_labels=False, edge_color="gray")
+    plt.title("2D Depth Graph with Curved Field of View and Occupancy Colors")
+    plt.xlabel("Width (m)")
+    plt.ylabel("Depth (m)")
+    # plt.gca().invert_yaxis()  # Invert y-axis for better visualization
+    plt.savefig(savename)
+
+
+def find_path(graph, start_node, target_node,
+              avoid_occlusion=False,
+              padding_distance=1,
+              mode="avoid_all", savename="observation_graph.png"):
+    """
+    Finds a path in the graph, snapping start/target to nearest free
+    space if they fall under padding.  Flags any path‐nodes that lie
+    within padding_distance of an occlusion node, computes their angles
+    from the (original) start point, and returns which start/target were used.
+
+    Returns a dict with:
+      - "path": the computed path (or None)
+      - "used_start": the node actually used as start
+      - "used_target": the node actually used as target
+      - "occlusions": list of occlusion nodes near the path
+      - "occluded_nodes": list of path‐nodes flagged
+      - "occlusion_angles": angles (degrees) from the original start_node
+      - "expanded_obstacles_all": padded obstacles (all)
+      - "expanded_obstacles_red": padded red obstacles
     """
 
-    def heuristic(node1, node2):
-        return np.sqrt((node1[0] - node2[0]) ** 2 + (node1[1] - node2[1]) ** 2)
+    def heuristic(n1, n2):
+        return np.hypot(n1[0] - n2[0], n1[1] - n2[1])
 
-    # Create a copy of the graph for all-obstacles pathfinding
-    pathfinding_graph = graph.graph.copy()
+    # copy graph for pathfinding
+    G = graph.graph.copy()
 
-    # Expand obstacles by padding_distance
-    obstacle_nodes = [node for node, data in graph.graph.nodes(data=True) if data.get('occupancy') & 1 == 1]
-    occlusion_nodes = [node for node, data in graph.graph.nodes(data=True) if data.get('occupancy') == 256]
-    expanded_obstacles_all = set()
-    expanded_obstacles_red = set()
+    # identify obstacles
+    obstacle_nodes = [n for n, d in G.nodes(data=True) if d.get('occupancy', 0) & 1]
+    occlusion_nodes = [n for n, d in G.nodes(data=True) if d.get('occupancy', 0) == 256]
 
+    expanded_all = set()
+    expanded_red = set()
+    r2 = padding_distance ** 2
+
+    # expand obstacles by padding_distance
     for node in obstacle_nodes:
-        depth, x = node
-        node_occupancy = graph.graph.nodes[node].get("occupancy", 0)
-        for d in range(-padding_distance, padding_distance + 1):
+        occ = G.nodes[node].get('occupancy', 0)
+        z0, x0 = node
+        for dz in range(-padding_distance, padding_distance + 1):
             for dx in range(-padding_distance, padding_distance + 1):
-                expanded_node = (depth + d, x + dx)
-                if expanded_node in graph.graph:
-                    expanded_obstacles_all.add(expanded_node)
-
-                    if node_occupancy & 6 == 6:  # Red obstacle
-                        expanded_obstacles_red.add(expanded_node)
+                if dz * dz + dx * dx <= r2:
+                    nbr = (z0 + dz, x0 + dx)
+                    if nbr in G:
+                        expanded_all.add(nbr)
+                        if (occ & 6) == 6:  # red flag
+                            expanded_red.add(nbr)
 
     if avoid_occlusion:
-        expanded_obstacles_all = list(expanded_obstacles_all) + list(occlusion_nodes)
-        expanded_obstacles_red = list(expanded_obstacles_red) + list(occlusion_nodes)
+        expanded_all |= set(occlusion_nodes)
+        expanded_red |= set(occlusion_nodes)
 
+    # prune graph
     if mode == "avoid_all":
-        pathfinding_graph.remove_nodes_from(expanded_obstacles_all)
+        G.remove_nodes_from(expanded_all)
     elif mode == "avoid_red":
-        pathfinding_graph.remove_nodes_from(expanded_obstacles_red)
+        G.remove_nodes_from(expanded_red)
     else:
         raise ValueError(f"Invalid mode: {mode}")
 
-    if start_node not in pathfinding_graph:
-        pathfinding_graph.add_node(start_node, pos=(0, 0), occupancy=0)
-    if target_node not in pathfinding_graph:
-        pathfinding_graph.add_node(target_node,
-                                   pos=(target_node[1] * graph.node_spacing, target_node[0] * graph.node_spacing),
-                                   occupancy=0)
+    # --- snap start/target to nearest free node if needed ---
+    if start_node in G:
+        used_start = start_node
+    else:
+        # find nearest remaining node in G by Euclidean distance
+        used_start = min(G.nodes, key=lambda n: heuristic(n, start_node))
 
-    if mode == "avoid_all":
-        try:
-            path = nx.astar_path(pathfinding_graph, start_node, target_node, heuristic=heuristic)
-        except nx.NetworkXNoPath:
-            path = None
-    elif mode == "avoid_red":
-        try:
-            path = nx.astar_path(pathfinding_graph, start_node, target_node, heuristic=heuristic)
-        except nx.NetworkXNoPath:
-            path = None
+    if target_node in G:
+        used_target = target_node
+    else:
+        used_target = min(G.nodes, key=lambda n: heuristic(n, target_node))
 
-    occlusions = None
+    draw_graph(G, special_nodes=[used_start, used_target], savename=savename)
+    # compute A* path
+    try:
+        path = nx.astar_path(G, used_start, used_target, heuristic=heuristic)
+    except nx.NetworkXNoPath:
+        path = None
 
-    if not avoid_occlusion and path is not None:
-        occlusions = [node for node in path if node in occlusion_nodes]
+    # flag occlusions: any path‐node within padding_distance of an occlusion node
+    occlusion_nodes = [n for n, d in G.nodes(data=True) if d.get('occupancy', 0) == 256]
+
+    occlusions = []
+    occluded_nodes = []
+    if path:
+        for p in path:
+            for occ in occlusion_nodes:
+                if heuristic(p, occ) <= padding_distance * 2:
+                    occlusions.append(occ)
+                    occluded_nodes.append(p)
+                    break
+
+    # compute angles (in degrees) from the ORIGINAL start_node to each occlusion
+    occlusion_angles = []
+    sx, sy = start_node
+    for (oz, ox) in occlusions:
+        dy = oz - sx
+        dx = ox - sy
+        occlusion_angles.append(np.degrees(np.arctan2(dy, dx)))
 
     return {
         "path": path,
+        "used_start": used_start,
+        "used_target": used_target,
         "occlusions": occlusions,
-        "expanded_obstacles_all": list(expanded_obstacles_all),
-        "expanded_obstacles_red": list(expanded_obstacles_red)
+        "occluded_nodes": occluded_nodes,
+        "occlusion_angles": occlusion_angles,
+        "expanded_obstacles_all": list(expanded_all),
+        "expanded_obstacles_red": list(expanded_red)
     }
