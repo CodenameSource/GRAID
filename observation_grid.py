@@ -1,7 +1,7 @@
 import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
-from scipy.spatial import distance
+from scipy.spatial import cKDTree
 
 from observation import ObservationGraph
 
@@ -21,51 +21,71 @@ class ObservationGrid:
     """
 
     def __init__(self, grid_size, node_spacing, origin=(0, 0), geo_origin=None, proximity_threshold_merging=.5):
-        self.graph = self.__generate_chunk(grid_size, node_spacing)
+        self.graph = self.__generate_chunk(grid_size, node_spacing, origin)
         self.grid_size = grid_size
         self.node_spacing = node_spacing
         self.origin = origin  # Origin of the grid in meters
         self.geo_origin = geo_origin  # Origin of the grid in GPS coordinates
         self.proximity_threshold_merging = proximity_threshold_merging
 
-    def add_observation(self, obs_graph: ObservationGraph):
-        obs_graph.rotate_obs_graph(obs_graph.rotation[1])
+    def add_observation(self, obs_graph: "ObservationGraph") -> nx.Graph:
+        """
+        Project every node from obs_graph onto this grid—both obstacles and free space.
+        Each observed node is assigned to the nearest unused grid cell (with fallback).
+        - If obs occupancy != 0, we OR its bits into the grid cell.
+        - If obs occupancy == 0 and the grid cell was unknown, we mark it free (0).
 
-        tmp_graph = obs_graph.graph.copy()
+        Returns the updated self.graph.
+        """
+        # Build KD‑tree over grid node positions
+        grid_nodes = list(self.graph.nodes)
+        positions = np.array([self.graph.nodes[n]["pos"] for n in grid_nodes])
+        tree = cKDTree(positions)
+        total = len(grid_nodes)
 
-        # Get positions from both graphs
-        square_positions = np.array(list(nx.get_node_attributes(self.graph, 'pos').values()))
-        fov_positions = np.array(list(nx.get_node_attributes(tmp_graph, 'pos').values()))
+        # Determine the “unknown” default occupancy (initial grid state)
+        default_unknown = next(iter(self.graph.nodes(data=True)))[1]["occupancy"]
 
-        # Extract node occupancy from both graphs
-        fov_occupancies = [tmp_graph.nodes[node].get('occupancy', 0) for node in tmp_graph.nodes]
+        used = set()
 
-        # Skip FOV nodes with occupancy == 0 (if they are not of interest)
-        fov_positions_of_interest = fov_positions  # fov_positions[np.array(fov_occupancies) > 0]
-        fov_occupancies_of_interest = fov_occupancies  # np.array(fov_occupancies)[np.array(fov_occupancies) > 0]
+        # Iterate every obs_graph node (including occupancy == 0)
+        for _, data in obs_graph.graph.nodes(data=True):
+            pos = data["pos"]
+            focc = data.get("occupancy", 0)
 
-        # Compute pairwise distances between FOV and square node positions
-        distances = distance.cdist(fov_positions_of_interest, square_positions, 'sqeuclidean')
+            # Get all grid‐cell candidates sorted by distance
+            dists, idxs = tree.query(pos, k=total, distance_upper_bound=np.inf)
+            if total == 1:
+                idxs = [idxs]
 
-        # Iterate over FOV nodes of interest and find the closest square node
-        for fov_idx, fov_pos in enumerate(fov_positions_of_interest):
-            fov_occupancy = fov_occupancies_of_interest[fov_idx]
+            # Find first unused grid index
+            chosen = next((i for i in idxs if i < total and i not in used), None)
+            # Fallback to absolute nearest if all used
+            if chosen is None and idxs and idxs[0] < total:
+                chosen = idxs[0]
+            if chosen is None:
+                continue
 
-            # Find the closest square node
-            closest_square_idx = np.argmin(distances[fov_idx])
-            closest_distance = distances[fov_idx, closest_square_idx]
+            used.add(chosen)
+            gnode = grid_nodes[chosen]
+            gocc = self.graph.nodes[gnode]["occupancy"]
 
-            if closest_distance <= self.proximity_threshold_merging:
-                # Get the corresponding square node
-                square_node = list(self.graph.nodes)[closest_square_idx]
-                square_occupancy = self.graph.nodes[square_node].get('occupancy', 0)
-
-                if square_occupancy == 256 or fov_occupancy & 1:
-                    self.graph.nodes[square_node]['occupancy'] = fov_occupancy
+            if focc:
+                # merge obstacle bits
+                self.graph.nodes[gnode]["occupancy"] = gocc | focc
+            elif gocc == default_unknown:
+                # mark free only if it was previously unknown
+                self.graph.nodes[gnode]["occupancy"] = 0
 
         return self.graph
 
-    def index_pos(self, pos, origin_pos=None):  # TODO Address floating point division weirdness
+    def get_pos(self, node):
+        try:
+            return self.graph.nodes[node]['pos']
+        except Exception:
+            return None
+
+    def index_by_pos(self, pos, origin_pos=None):
         """
         Converts a position in meters to a grid index.
         :param pos:
@@ -113,29 +133,34 @@ class ObservationGrid:
         Returns the geographical extents of the grid in GPS coordinates.
 
         Returns:
-        - tuple: (longitude, latitude) of the grid origin.
+        - dict: {width, height, left, right, bottom, top}
         """
-
-        def add_to_geo_coordinates_meter(meter_x, meter_y, origin_lat):
-            earth_radius = 6378137.0
-            meter_x = meter_x / earth_radius
-            meter_y = meter_y / earth_radius
-            lat = origin_lat + (meter_y * (180 / np.pi))
-            lon = meter_x / np.cos(origin_lat * np.pi / 180) + origin_lat
-            return lon, lat
-
         if self.geo_origin is None:
             raise ValueError("Geographical origin not set for the grid.")
 
-        relative_extents = self.extents_relative()
+        # Relative extents in meters
+        rel = self.extents_relative()
+
+        # Helper: convert meter offsets to geo coords
+        def add_to_geo_coordinates_meter(meter_x, meter_y, origin_lat, origin_lon):
+            earth_radius = 6378137.0
+            # convert meter offsets to radians
+            rad_x = meter_x / earth_radius
+            rad_y = meter_y / earth_radius
+            # convert radians to degrees
+            delta_lat = rad_y * (180.0 / np.pi)
+            delta_lon = rad_x * (180.0 / np.pi) / np.cos(np.deg2rad(origin_lat))
+            lat = origin_lat + delta_lat
+            lon = origin_lon + delta_lon
+            return {"lat": lat, "lon": lon}
 
         geo_extents = {
-            'width': relative_extents['width'],
-            'height': relative_extents['height'],
-            'left': add_to_geo_coordinates_meter(relative_extents['left'], 0, self.geo_origin[1]),
-            'right': add_to_geo_coordinates_meter(relative_extents['right'], 0, self.geo_origin[1]),
-            'bottom': add_to_geo_coordinates_meter(0, relative_extents['bottom'], self.geo_origin[1]),
-            'top': add_to_geo_coordinates_meter(0, relative_extents['top'], self.geo_origin[1])
+            'width': rel['width'],
+            'height': rel['height'],
+            'left': add_to_geo_coordinates_meter(rel['left'], 0, self.geo_origin['lat'], self.geo_origin['lon']),
+            'right': add_to_geo_coordinates_meter(rel['right'], 0, self.geo_origin['lat'], self.geo_origin['lon']),
+            'bottom': add_to_geo_coordinates_meter(0, rel['bottom'], self.geo_origin['lat'], self.geo_origin['lon']),
+            'top': add_to_geo_coordinates_meter(0, rel['top'], self.geo_origin['lat'], self.geo_origin['lon'])
         }
 
         return geo_extents
@@ -152,7 +177,7 @@ class ObservationGrid:
         """
 
         extents = self.extents_relative()
-        return extents['left'] <= point[0] <= extents['right'] and extents['bottom'] <= point[1] <= extents['top']
+        return extents['bottom'] <= point[0] <= extents['top'] and extents['left'] <= point[1] <= extents['right']
 
     def is_geo_point_in_grid(self, point):
         """
@@ -168,7 +193,7 @@ class ObservationGrid:
         return extents['left'][0] <= point[0] <= extents['right'][0] and extents['bottom'][1] <= point[1] <= \
             extents['top'][1]
 
-    def visualize(self):
+    def visualize(self, name="observation_grid.png"):
         positions = nx.get_node_attributes(self.graph, 'pos')
 
         # Ensure node_colors matches the number of nodes in the graph
@@ -208,7 +233,57 @@ class ObservationGrid:
         plt.title("Obstacle Graph Visualization")
         plt.xlabel("Width (m)")
         plt.ylabel("Depth (m)")
-        plt.show()
+        plt.savefig(name)
+
+    def visualize_path(self, path, name="observation_grid_path.png", title="Path Visualization"):
+        """
+        Visualizes the obstacle grid with a given path overlaid.
+
+        Parameters:
+        - path (list): A list of nodes representing the path.
+        - title (str): Title for the plot.
+        """
+        positions = nx.get_node_attributes(self.graph, 'pos')
+
+        # Build node colors based on occupancy
+        node_colors = []
+        for node in self.graph.nodes:
+            occupancy = self.graph.nodes[node].get('occupancy', 0)
+            if occupancy == 0:
+                node_colors.append('blue')  # Free space
+            elif occupancy == 3:
+                node_colors.append('yellow')
+            elif occupancy == 5:
+                node_colors.append('orange')
+            elif occupancy == 128:
+                node_colors.append('purple')  # Target
+            elif occupancy == 256:
+                node_colors.append('gray')  # Occlusion
+            else:
+                node_colors.append('red')  # Obstacle
+
+        # Plot the base graph
+        plt.figure(figsize=(12, 10))
+        nx.draw(
+            self.graph,
+            pos=positions,
+            node_size=5,
+            node_color=node_colors,
+            with_labels=False,
+            edge_color="gray"
+        )
+
+        # Plot the path if one is provided
+        if path:
+            path_edges = list(zip(path[:-1], path[1:]))
+            nx.draw_networkx_nodes(self.graph, pos=positions, nodelist=path, node_color='green', node_size=15)
+            nx.draw_networkx_edges(self.graph, pos=positions, edgelist=path_edges, edge_color='green', width=2)
+
+        plt.title(title)
+        plt.xlabel("Width (m)")
+        plt.ylabel("Depth (m)")
+        plt.savefig(name)
+
 
     @staticmethod
     def rotate_obs_graph(graph, angle_degrees, origin=(0, 0)):
@@ -235,7 +310,7 @@ class ObservationGrid:
         nx.set_node_attributes(graph, new_positions, 'pos')
 
     @staticmethod
-    def __generate_chunk(grid_size=10, node_spacing=0.5):
+    def __generate_chunk(grid_size=10, node_spacing=0.5, origin=(0, 0)):
         """
         Generates a square graph with a given grid size and node spacing.
         The origin (0, 0) is positioned at the bottom middle of the grid.
@@ -251,8 +326,8 @@ class ObservationGrid:
         chunk_graph = nx.grid_2d_graph(grid_size, grid_size)
 
         # Calculate offsets to shift the origin to the bottom middle
-        x_offset = -(grid_size // 2) * node_spacing  # Center x-coordinates horizontally
-        y_offset = 0  # Bottom row starts at y=0
+        x_offset = -(grid_size // 2) * node_spacing + origin[0]
+        y_offset = 0 + origin[1]
 
         # Assign positions and other attributes to the nodes
         node_attributes = {
@@ -278,19 +353,20 @@ def copy_grid(grid1: ObservationGrid, grid2: ObservationGrid):
     Returns:
     - None (modifies graph2 in place)
     """
+
+    def round_pos(pos) -> tuple:
+        return round(pos[0], 2), round(pos[1], 2)
+
+
     graph1 = grid1.graph
     graph2 = grid2.graph
 
-    pos1 = nx.get_node_attributes(graph1, 'pos')
-    occupancy1 = nx.get_node_attributes(graph1, 'occupancy')
-    pos2 = nx.get_node_attributes(graph2, 'pos')
+    pos_to_attrs = {round_pos(data.get('pos')): data for n, data in graph1.nodes(data=True)}
 
-    graph2_attributes = {}
+    for n2, data2 in graph2.nodes(data=True):
+        pos2 = round_pos(data2.get('pos'))
+        if pos2 in pos_to_attrs:
+            graph2.nodes[n2].update(pos_to_attrs[pos2])
 
-    for node2, pos_value2 in pos2.items():
-        if pos_value2 in pos1.values():
-            pos1_index = list(pos1.values()).index(pos_value2)
-            occupancy1_value = occupancy1[list(pos1.keys())[pos1_index]]
-            graph2_attributes[node2] = {"pos": pos_value2, "occupancy": occupancy1_value}
-
-    nx.set_node_attributes(graph2, graph2_attributes)
+    grid2.graph = graph2
+    return grid2
