@@ -1,9 +1,29 @@
 import numpy as np
+import cv2
 
 from observation import ObservationGraph
 
+from dataclasses import dataclass
+from typing import List, Sequence
 
-# TODO: Account for altitude
+
+@dataclass
+class Kernel:
+    x: int
+    y: int
+    activated: bool
+    depth: float
+
+
+@dataclass
+class ProjectionKernels:
+    projection_level: np.ndarray
+    depth: int
+    kernel_horizontal_size_m: float
+    kernel_vertical_size_m: float
+    kernel_horizontal_pixels: int
+    kernel_vertical_pixels: int
+    kernels: List[Kernel]
 
 def generate_projection_images(depth_data, max_depth=10, fov_horizontal=90, fov_vertical=60):
     """
@@ -39,210 +59,253 @@ def generate_projection_images(depth_data, max_depth=10, fov_horizontal=90, fov_
     return projection_images
 
 
-def apply_kernels(projection_images, kernel_horizontal_size=0.2, kernel_vertical_size=1.5,
-                  fov_horizontal=90, fov_vertical=60, percentile=10):
+def apply_kernels(
+        projection_images: Sequence[np.ndarray],
+        kernel_horizontal_size: float = 0.2,
+        kernel_vertical_size: float = 1.5,
+        fov_horizontal: float = 90.0,
+        fov_vertical: float = 60.0,
+        percentile: float = 10.0
+) -> List[ProjectionKernels]:
     """
-    Applies kernel logic to projection images based on a given percentile.
+    Partition each depth‐level image into rectangular kernels and flag those
+    whose given percentile depth lies within [depth-1, depth).
 
-    Args:
-        projection_images (list of numpy.ndarray): Cropped projection images for each depth level.
-        kernel_horizontal_size (float): Horizontal kernel size in meters.
-        kernel_vertical_size (float): Vertical kernel size in meters.
-        fov_horizontal (float): Horizontal field of view in degrees.
-        fov_vertical (float): Vertical field of view in degrees.
-        percentile (int): Percentile value to determine kernel activation.
+    Parameters
+    ----------
+    projection_images
+        List of 2D depth images (one per depth level), assumed same shape.
+    kernel_horizontal_size
+        Kernel width in meters.
+    kernel_vertical_size
+        Kernel height in meters.
+    fov_horizontal
+        Horizontal field‐of‐view in degrees.
+    fov_vertical
+        Vertical field‐of‐view in degrees.
+    percentile
+        Percentile (0–100) used to summarize each kernel.
 
-    Returns:
-        list of dict: List of kernels for each projection image. Each kernel is represented as a dictionary
-                      containing kernel metadata and activation status.
+    Returns
+    -------
+    List[ProjectionKernels]
     """
-    # Convert FOV to radians
-    fov_horizontal_radians = np.radians(fov_horizontal)
-    fov_vertical_radians = np.radians(fov_vertical)
+    # --- Validate inputs ---
+    if not projection_images:
+        return []
+    if kernel_horizontal_size <= 0 or kernel_vertical_size <= 0:
+        raise ValueError("Kernel sizes must be positive.")
+    if not (0.0 <= percentile <= 100.0):
+        raise ValueError("Percentile must be in [0, 100].")
 
-    # Calculate pixel-to-meter ratio (assume all images have the same dimensions)
-    projection_shape = projection_images[0].shape
-    pixel_to_meter_ratio_horizontal = 2 * np.tan(fov_horizontal_radians / 2) / projection_shape[1]
-    pixel_to_meter_ratio_vertical = 2 * np.tan(fov_vertical_radians / 2) / projection_shape[0]
+    # --- Precompute pixel‐to‐meter ratios ---
+    h_px, w_px = projection_images[0].shape[:2]
+    fh_rad = np.radians(fov_horizontal)
+    fv_rad = np.radians(fov_vertical)
+    m_per_px_h = (2 * np.tan(fh_rad / 2)) / w_px
+    m_per_px_v = (2 * np.tan(fv_rad / 2)) / h_px
 
-    kernels_per_projection = []
+    result: List[ProjectionKernels] = []
 
-    for depth, cropped_image in enumerate(projection_images, start=1):
-        # Calculate kernel size in pixels for the current depth
-        kernel_horizontal_pixels = int(kernel_horizontal_size / (pixel_to_meter_ratio_horizontal * depth))
-        kernel_vertical_pixels = int(kernel_vertical_size / (pixel_to_meter_ratio_vertical * depth))
+    for depth_idx, img in enumerate(projection_images, start=1):
+        # kernel size in pixels at this depth (ensure ≥1)
+        kw = max(1, int(kernel_horizontal_size / (m_per_px_h * depth_idx)))
+        kh = max(1, int(kernel_vertical_size / (m_per_px_v * depth_idx)))
 
-        kernels = []
+        kernels: List[Kernel] = []
+        # iterate over grid
+        for y in range(0, h_px, kh):
+            y_end = min(y + kh, h_px)
+            for x in range(0, w_px, kw):
+                x_end = min(x + kw, w_px)
+                block = img[y:y_end, x:x_end]
+                if block.size == 0:
+                    continue
 
-        for x in range(0, cropped_image.shape[1], kernel_horizontal_pixels):
-            for y in range(0, cropped_image.shape[0], kernel_vertical_pixels):
-                # Extract the kernel region
-                kernel = cropped_image[y:y + kernel_vertical_pixels, x:x + kernel_horizontal_pixels]
+                # median or percentile summary
+                val = np.percentile(block, percentile)
+                # activated if depth-1 ≤ val < depth
+                active = (depth_idx - 1) <= val < min(depth_idx, len(projection_images))
+                kernels.append(Kernel(x=x, y=y, activated=active, depth=float(val)))
 
-                # Check the specified percentile depth within the kernel
-                if kernel.size > 0:
-                    kernel_percentile = np.percentile(kernel, percentile)
-                    kernel_activated = (kernel_percentile < depth) and (kernel_percentile > depth - 1)
+        result.append(ProjectionKernels(
+            projection_level=img,
+            depth=depth_idx,
+            kernel_horizontal_size_m=kernel_horizontal_size,
+            kernel_vertical_size_m=kernel_vertical_size,
+            kernel_horizontal_pixels=kw,
+            kernel_vertical_pixels=kh,
+            kernels=kernels
+        ))
 
-                    if not kernel_activated:
-                        pass
-
-                    # Save the kernel details
-                    kernels.append({
-                        "x": x,
-                        "y": y,
-                        "activated": kernel_activated
-                    })
-
-        kernels_per_projection.append({
-            "projection_level": cropped_image,
-            "depth": depth,
-            "horisontal_size": kernel_horizontal_size,
-            "vertical_size": kernel_vertical_size,
-            "kernel_horisontal_pixels": kernel_horizontal_pixels,
-            "kernel_vertical_pixels": kernel_vertical_pixels,
-            "kernels": kernels
-        })
-
-    return kernels_per_projection
+    return result
 
 
-def bundle_kernels_to_larger_verticals(kernels_per_projection, target_vertical_size):
+def bundle_kernels_to_larger_verticals(
+        projections: List[ProjectionKernels],
+        target_vertical_size_m: float
+) -> List[ProjectionKernels]:
     """
-    Bundles kernels into larger vertical sizes by aggregating smaller vertical kernels.
+    Aggregate each ProjectionKernels’ small vertical kernels into taller bins
+    of size `target_vertical_size_m`, updating activation and choosing the
+    minimum depth among members.
 
-    Args:
-        kernels_per_projection (list of dict): List of kernels for each projection image, where each kernel is represented
-                                              as a dictionary containing kernel metadata and activation status.
-        target_vertical_size (float): Desired vertical size of the bundled kernels (in meters).
+    Parameters
+    ----------
+    projections : List[ProjectionKernels]
+        The per‐depth projection + kernel bundles to re‐bin.
+    target_vertical_size_m : float
+        Desired vertical size (in meters) of each bundled kernel.
 
-    Returns:
-        list of dict: Bundled kernels for each projection image with updated vertical sizes and activation status.
+    Returns
+    -------
+    List[ProjectionKernels]
+        New list of ProjectionKernels with updated `.kernel_vertical_size_m`,
+        `.kernel_vertical_pixels`, and `.kernels` aggregated vertically.
     """
-    bundled_kernels_per_projection = []
+    bundled_projs: List[ProjectionKernels] = []
 
-    for projection in kernels_per_projection:
-        current_vertical_size = projection["vertical_size"]
-        vertical_ratio = round(target_vertical_size / current_vertical_size)
-
-        if vertical_ratio <= 1:
-            # No need to bundle if the target size is smaller or equal to the current size
-            bundled_kernels_per_projection.append(projection)
+    for proj in projections:
+        # how many small‐kernels stack to reach the target height?
+        ratio = round(target_vertical_size_m / proj.kernel_vertical_size_m)
+        if ratio <= 1:
+            # no up‐binning needed
+            bundled_projs.append(proj)
             continue
 
-        kernel_dict = {}
+        # new pixel height of each bundled kernel
+        new_kh_px = proj.kernel_vertical_pixels * ratio
 
-        # Group kernels into larger vertical segments
-        for kernel in projection["kernels"]:
-            vertical_group = kernel["y"] // (vertical_ratio * projection["kernel_vertical_pixels"])
-            key = (kernel["x"], vertical_group)
-            if key not in kernel_dict:
-                kernel_dict[key] = []
-            kernel_dict[key].append(kernel)
+        # group by (x position, vertical group index)
+        groups: dict[tuple[int, int], List[Kernel]] = {}
+        for k in proj.kernels:
+            group_idx = k.y // new_kh_px
+            key = (k.x, group_idx)
+            groups.setdefault(key, []).append(k)
 
-        # Aggregate masks and activations within each vertical group
-        bundled_kernels = []
-        for (x, vertical_group), kernels in kernel_dict.items():
-            bundled_activation = False
+        # build the new, aggregated kernels
+        new_kernels: List[Kernel] = []
+        for (x, grp), members in groups.items():
+            activated = any(k.activated for k in members)
+            # pick the smallest‐depth among the group
+            depth_val = min(k.depth for k in members)
+            y_pos = grp * new_kh_px
+            new_kernels.append(Kernel(
+                x=x,
+                y=y_pos,
+                activated=activated,
+                depth=depth_val
+            ))
 
-            for kernel in kernels:
-                if kernel["activated"]:
-                    bundled_activation = True
-                    break
+        # construct a new ProjectionKernels record
+        bundled_projs.append(ProjectionKernels(
+            projection_level=proj.projection_level,
+            depth=proj.depth,
+            kernel_horizontal_size_m=proj.kernel_horizontal_size_m,
+            kernel_vertical_size_m=target_vertical_size_m,
+            kernel_horizontal_pixels=proj.kernel_horizontal_pixels,
+            kernel_vertical_pixels=new_kh_px,
+            kernels=new_kernels
+        ))
 
-            bundled_kernels.append({
-                "x": x,
-                "y": vertical_group * vertical_ratio * projection["kernel_vertical_pixels"],
-                "activated": bundled_activation
-            })
-
-        bundled_kernels_per_projection.append({
-            "projection_level": projection["projection_level"],
-            "depth": projection["depth"],
-            "horisontal_size": projection["horisontal_size"],
-            "vertical_size": target_vertical_size,
-            "kernel_horisontal_pixels": projection["kernel_horisontal_pixels"],
-            "kernel_vertical_pixels": vertical_ratio * projection["kernel_vertical_pixels"],
-            "kernels": bundled_kernels
-        })
-
-    return bundled_kernels_per_projection
+    return bundled_projs
 
 
-def map_obstacles_graph(obs_graph: ObservationGraph, kernels_per_projection, percentile=10):
+def map_obstacles_graph(
+        obs_graph: ObservationGraph,
+        projections: List[ProjectionKernels]
+) -> ObservationGraph:
     """
-    Creates an obstacle graph using the kernel activations.
+    Marks graph nodes as obstacles wherever a kernel is activated.
 
-    Args:
-        obs_graph (ObservationGraph): Empty obstacle graph to populate.
-        kernels_per_projection (list of dict): List of kernels for each projection image.
-        percentile (int): Percentile value to determine kernel activation.
+    Parameters
+    ----------
+    obs_graph : ObservationGraph
+        The empty (or partially populated) graph to annotate.
+    projections : List[ProjectionKernels]
+        Each projection holds its pixel‐to‐meter sizes and a list of Kernel(x, y, activated, depth).
 
-    Returns:
-        ObsGraph: Graph with obstacles set based on kernel activations.
+    Returns
+    -------
+    ObservationGraph
+        The same graph instance, with `occupancy` flags set for each obstacle.
     """
-    for projection in kernels_per_projection:
-        depth = projection["depth"]
-        kernel_h_pixels = projection["kernel_horisontal_pixels"]
-        kernel_v_pixels = projection["kernel_vertical_pixels"]
+    for proj in projections:
+        # pre‐pull to avoid repeated attribute lookups
+        kw_px = proj.kernel_horizontal_pixels
+        kw_m = proj.kernel_horizontal_size_m
+        spacing = obs_graph.node_spacing
 
-        for kernel in projection["kernels"]:
-            if kernel["activated"]:
-                x = kernel["x"]
-                y = kernel["y"]
+        for kern in proj.kernels:
+            if not kern.activated:
+                continue
 
-                kernel_x_m = (x / projection["kernel_horisontal_pixels"]) * projection["horisontal_size"]
+            # 1) Compute the kernel's center‐line X in meters
+            kernel_x_m = round((kern.x / kw_px) * kw_m, 2)
+            # 2) Depth (in meters) is already on the Kernel dataclass
+            d0 = kern.depth - .4  # Test for a bugfixing hypothesis
+            # 3) Compute graph coords for the front and back faces of this 1‐step‐thick obstacle
+            depth_start, x_start = obs_graph.kernel_to_graph_coord(d0, kernel_x_m)
+            depth_end, x_end = obs_graph.kernel_to_graph_coord(d0 + spacing, kernel_x_m + kw_m)
 
-                # Create a mask for the kernel based on its size
-                kernel_percentile_depth = np.percentile(
-                    projection["projection_level"][y:y + kernel_v_pixels, x:x + kernel_h_pixels], percentile
-                )
+            x_start = min(x_start, x_end)
+            x_end = max(x_start, x_end)
 
-                # Set the obstacle in the graph if the percentile depth condition is met
-                if depth > kernel_percentile_depth > depth - 1:
-                    depth_start, x_start = obs_graph.kernel_to_graph_coord(kernel_percentile_depth, kernel_x_m)
-                    _, x_end = obs_graph.kernel_to_graph_coord(kernel_percentile_depth + obs_graph.node_spacing,
-                                                               kernel_x_m + projection["horisontal_size"])
-
-                    obs_graph.set_obstacle(depth_start, depth_start, x_start, x_end)
+            # 4) Mark that rectangle in the graph
+            obs_graph.set_obstacle(depth_start, depth_end, x_start, x_end)
 
     return obs_graph
 
 
-def overlay_kernels_on_image(projection, opacity=0.5):
+def overlay_kernels_on_image(
+        proj: ProjectionKernels,
+        opacity: float = 0.5
+) -> np.ndarray:
     """
-    Overlays kernel activations on the original image with a specified opacity.
+    Overlay activated kernels (red boxes) onto the depth image stored in proj.
 
-    Args:
-        projection (dict): Projection image with kernel activations.
-        opacity (float): Opacity of the overlay (0 to 1).
+    Parameters
+    ----------
+    proj : ProjectionKernels
+        Contains `projection_level` (HxW), pixel‐sized kernels, and their activation flags.
+    opacity : float, default=0.5
+        Blend factor for the red overlay (0.0–1.0).
 
-    Returns:
-        numpy.ndarray: Image with kernel activations overlaid.
+    Returns
+    -------
+    np.ndarray
+        RGB image with activated‐kernel regions tinted red.
     """
-    original_image = projection["projection_level"] * 255 / 15
-    kernels_width = projection["kernel_horisontal_pixels"]
-    kernels_height = projection["kernel_vertical_pixels"]
-    kernels_per_projection = projection["kernels"]
+    alpha = float(np.clip(opacity, 0.0, 1.0))
+    img = proj.projection_level * 10
 
-    # Convert original image to RGB if necessary
-    if len(original_image.shape) == 2 or original_image.shape[2] == 1:
-        original_image = np.stack([original_image] * 3, axis=-1)
+    # ensure RGB
+    if img.ndim == 2 or (img.ndim == 3 and img.shape[2] == 1):
+        img_rgb = cv2.cvtColor(img.astype(np.uint8), cv2.COLOR_GRAY2RGB)
+    else:
+        img_rgb = img.copy()
 
-    # Create a red overlay for activated kernels
-    red_overlay = np.zeros_like(original_image, dtype=np.uint8)
+    h, w = img_rgb.shape[:2]
+    overlay = np.zeros_like(img_rgb)
 
-    for kernel in kernels_per_projection:
-        if kernel["activated"]:
-            x = kernel["x"]
-            y = kernel["y"]
+    kw, kh = proj.kernel_horizontal_pixels, proj.kernel_vertical_pixels
 
-            # Ensure the overlay dimensions are valid
-            overlay_y_end = min(y + kernels_height, red_overlay.shape[0])
-            overlay_x_end = min(x + kernels_width, red_overlay.shape[1])
-            red_overlay[y:overlay_y_end, x:overlay_x_end, 0] = 255
+    # draw red rectangles for each activated kernel
+    for k in proj.kernels:
+        if not k.activated:
+            continue
+        x0, y0 = k.x, k.y
+        x1 = min(x0 + kw, w)
+        y1 = min(y0 + kh, h)
+        cv2.rectangle(overlay, (x0, y0), (x1, y1), (255, 0, 0), thickness=-1)
 
-    # Blend the original image with the red overlay
-    overlaid_image = np.clip((1 - opacity) * original_image + opacity * red_overlay, 0, 255).astype(np.uint8)
+    mask = overlay[:, :, 0] > 0
+    if not mask.any():
+        return img_rgb
 
-    return overlaid_image
+    blended = cv2.addWeighted(img_rgb, 1.0 - alpha, overlay, alpha, 0)
+    # composite only the masked pixels
+    result = img_rgb.copy()
+    result[mask] = blended[mask]
+
+    return result
