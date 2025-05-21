@@ -1,13 +1,18 @@
 import asyncio
+import os
+import nest_asyncio
 import json
 import time
-
 import numpy as np
+import cv2
+import math
+
+from typing import List, Tuple
 
 from Smav import Waypoint
-from connection_config import ConnectionConfig
+from imagery.connection_config import ConnectionConfig
 from depth_analysis import generate_projection_images, apply_kernels, bundle_kernels_to_larger_verticals, \
-    map_obstacles_graph
+    map_obstacles_graph, overlay_kernels_on_image
 from imagery import DroneExtended
 from observation import ObservationGraph
 from observation_grid import ObservationGrid
@@ -15,6 +20,9 @@ from observation_space import ObservationSpace
 from pathfinding import find_path
 from webapp import WebApp
 
+nest_asyncio.apply()
+
+PATH_IDX = 0
 
 class ObstacleAvoidance:
     """
@@ -47,12 +55,29 @@ class ObstacleAvoidance:
         Args:
         - connection_config (ConnectionConfig): The connection configuration.
         """
+
+        def create_initial_grid(grid_size, node_spacing, origin, geo_origin, proximity_threshold_mergind,
+                                padding_meters=2):
+            initial_grid = ObservationGrid(grid_size, node_spacing, origin, geo_origin, proximity_threshold_mergind)
+
+            padding_nodes = int(math.ceil(padding_meters / node_spacing)) // 2
+            for depth in range(padding_nodes * 2):
+                for horizontal in range(-padding_nodes, padding_nodes):
+                    node = (grid_size // 2 + horizontal, depth)
+                    if node in initial_grid.graph:
+                        initial_grid.graph.nodes[node]["occupancy"] = 0
+
+            return initial_grid
+
         drone = DroneExtended(connection_config)
+        if connection_config.type == "airsim" and connection_config.reset_simulation == True:
+            drone.get_simulator().reset()
+
         drone_location = drone.get_location()
         heading_origin = drone_location["hdg"]
         geo_origin = {"lat": drone_location["lat"], "lon": drone_location["lon"]}
-        initial_grid = ObservationGrid(200, .2, (0, 0), geo_origin, 0.1)
-        self.observation_space = ObservationSpace(200, .2, [initial_grid], geo_origin, heading_origin, drone)
+        initial_grid = create_initial_grid(200, .2, (0, 0), geo_origin, 0.1, 3)
+        self.observation_space = ObservationSpace(200, .2, 0.1, [initial_grid], geo_origin, heading_origin, drone)
 
     def initialise_mission_waypoints(self, waypoints: [Waypoint]) -> None:
         """
@@ -64,7 +89,7 @@ class ObstacleAvoidance:
         self.waypoints = waypoints
         self.waypoint_idx = 0
 
-    def observe(self):
+    def observe(self) -> [ObservationGraph]:
         """
         Observes the environment.
         Steps:
@@ -79,8 +104,9 @@ class ObstacleAvoidance:
         - List[ObservationGraph]: The observation data.
         """
         observations = []
+        overlaid_images = []
 
-        drone_location = self.observation_space.drone.get_location()
+        drone_location = self.observation_space.drone_location()
         observation_hdg = drone_location["hdg"]
         observation_geo_origin = {"lat": drone_location["lat"], "lon": drone_location["lon"]}
 
@@ -88,30 +114,43 @@ class ObstacleAvoidance:
                                                                self.observation_space.geo_origin["lon"],
                                                                drone_location["lat"], drone_location["lon"])
 
+        observation_origin = self.observation_space.snap_to_node_spacing(observation_origin)
+
         for image in self.observation_space.drone.get_depth_images():
-            horizontal_fov = image["config"].fov_horizontal
-            vertical_fov = image["config"].fov_vertical
+            horizontal_fov = image["config"].horisontal_fov
+            vertical_fov = image["config"].vertical_fov
             heading_image = (observation_hdg + image["config"].rotation[1]) % 360
 
             projection_levels = generate_projection_images(image["images"][0], max_depth=self.max_observation_depth,
                                                            fov_horizontal=horizontal_fov, fov_vertical=vertical_fov)
             activations = apply_kernels(projection_levels, kernel_horizontal_size=self.observation_space.node_spacing,
                                         kernel_vertical_size=.1,
-                                        fov_horizontal=horizontal_fov, fov_vertical=vertical_fov, percentile=10)
-            activations = bundle_kernels_to_larger_verticals(activations, target_vertical_size=.5)
+                                        fov_horizontal=horizontal_fov, fov_vertical=vertical_fov, percentile=1)
+
+            global PATH_IDX
+            if not os.path.exists(f"activations/observation_{PATH_IDX}/"):
+                os.makedirs(f"activations/observation_{PATH_IDX}/")
+
+            depth_image = image['images'][0].copy()
+            for idx, level in enumerate(activations):
+                depth_image = overlay_kernels_on_image(level, ((idx + 1) / len(activations) * 1))
+                cv2.imwrite(f"activations/observation_{PATH_IDX}/kernels_level_{idx}.png", depth_image)
+            overlaid_images.append(depth_image)  # For debugging purposes
+
+            activations = bundle_kernels_to_larger_verticals(activations, target_vertical_size_m=1.5)
 
             observation_graph = ObservationGraph(horizontal_fov, self.max_observation_depth,
                                                  self.observation_space.node_spacing, .9,
-                                                 activations[0]["projection_level"].shape[1], observation_origin,
+                                                 activations[0].projection_level.shape[1], observation_origin,
                                                  observation_geo_origin, (0, heading_image, 0))
 
             observation_graph = map_obstacles_graph(observation_graph, activations)
+            observation_graph.apply_occlusion()
             observations.append(observation_graph)
-            # overlay_kernels_on_image(projection_levels) For debugging purposes
 
-        return observations
+        return observations, overlaid_images
 
-    def check_activation(self, observation: ObservationGraph, padding: int = 7) -> (int, dict):
+    def check_activation(self, observation: ObservationGraph, padding_meters: int = .8) -> (int, dict):
         """
         Determines if obstacle avoidance should be activated.
 
@@ -123,6 +162,8 @@ class ObstacleAvoidance:
         - int: 0 for no activation required, 1 for activation required, 2 for blocked waypoint
         - dict: Path information if obstacle avoidance is activated, None otherwise.
         """
+
+        padding_nodes = int(padding_meters // self.observation_space.node_spacing)
 
         source_pos = observation.origin
         target_waypoint = self.waypoints[self.waypoint_idx]
@@ -136,8 +177,8 @@ class ObstacleAvoidance:
 
         self.webapp.set_working_grid(working_grid)
 
-        source_node = working_grid.index_pos(source_pos)
-        target_node = working_grid.index_pos(target_pos)
+        source_node = working_grid.index_by_pos(source_pos)
+        target_node = working_grid.index_by_pos(target_pos)
 
         target_node_occupancy = working_grid.graph.nodes[target_node].get('occupancy', 0)
         if target_node_occupancy == 256:
@@ -145,13 +186,16 @@ class ObstacleAvoidance:
         elif target_node_occupancy & 1 == 1:
             return 2, None
 
-        path = find_path(working_grid, source_node, target_node, avoid_occlusion=True, padding_distance=padding)
+        path = find_path(working_grid, source_node, target_node, avoid_occlusion=True, padding_distance=padding_nodes)
         if path["path"]:
-            return 0, path
-        else:
-            return 1, None
+            path = self.path_next(observation, padding_meters, True)
+            if path['full_path']:
+                return 0, path
 
-    def path_next(self, last_observation: ObservationGraph, padding: int = 7) -> dict | None:
+        return 1, None
+
+    def path_next(self, last_observation: ObservationGraph, padding_meters: int = .6,
+                  avoid_occlusion=False) -> dict | None:
         """
         Handles obstacle avoidance logic.
 
@@ -162,69 +206,81 @@ class ObstacleAvoidance:
         Returns:
         - dict: Path information to follow if obstacle avoidance was successful, None otherwise.
         """
+        Point = Tuple[float, float]
+        Segment = Tuple[Point, Point]
 
         def calculate_angle(p1, p2):
             """Calculate the angle (in degrees) of the line segment from p1 to p2."""
             return np.degrees(np.arctan2(p2[0] - p1[0], p2[1] - p1[1]))
 
-        def vectorise(points, angle_tolerance=5):
+        def vectorise(
+                points: List[Point],
+                epsilon: float = 2.0
+        ) -> List[Segment]:
             """
-            Bundle points into segments for straight lines, accounting for distance between points when measuring angles.
+            Simplify a rasterized polyline into straight segments.
 
-            Parameters:
-            - points: List of (x, y) tuples representing rasterized points.
-            - angle_tolerance: Tolerance for angle difference to consider points collinear (default: very small).
+            Parameters
+            ----------
+            points
+                Ordered list of (x,y) coordinates.
+            epsilon
+                Max perpendicular deviation (in pixels) for RDP.
 
-            Returns:
-            - List of segments where each segment is a list of (x, y) tuples.
+            Returns
+            -------
+            List of (start, end) pairs for each vector segment.
             """
+
+            def _point_line_distance(p: Point, a: Point, b: Point) -> float:
+                """
+                Perpendicular distance from p to line ab.
+                If a == b, returns euclidean(p, a).
+                """
+                x0, y0 = p
+                x1, y1 = a
+                x2, y2 = b
+
+                dx = x2 - x1
+                dy = y2 - y1
+                if dx == 0 and dy == 0:
+                    return math.hypot(x0 - x1, y0 - y1)
+
+                return abs(dy * x0 - dx * y0 + x2 * y1 - y2 * x1) / math.hypot(dx, dy)
+
+            def _rdp(points: List[Point], epsilon: float) -> List[Point]:
+                """
+                Recursive Ramer–Douglas–Peucker.
+                https://en.wikipedia.org/wiki/Ramer%E2%80%93Douglas%E2%80%93Peucker_algorithm
+                """
+                if len(points) < 3:
+                    return points.copy()
+
+                # find point with max distance to chord
+                a, b = points[0], points[-1]
+                idx_max, dist_max = 0, 0.0
+                for i in range(1, len(points) - 1):
+                    d = _point_line_distance(points[i], a, b)
+                    if d > dist_max:
+                        idx_max, dist_max = i, d
+
+                if dist_max > epsilon:
+                    # split and recurse
+                    left = _rdp(points[: idx_max + 1], epsilon)
+                    right = _rdp(points[idx_max:], epsilon)
+                    # stitch, dropping duplicate
+                    return left[:-1] + right
+                else:
+                    # all intermediate points can be dropped
+                    return [a, b]
+
+
 
             if len(points) < 2:
-                return [points]
+                return []
 
-            segments = []
-            segment_angles = []
-            current_segment = [points[0]]
-            current_angle = None
-            last_angle = None
-
-            for i in range(1, len(points)):
-                angle_from_prvs_point = calculate_angle(points[i - 1], points[i])
-                angle_from_segment = sum([calculate_angle(point, points[i]) for point in current_segment]) / len(
-                    current_segment)
-
-                if current_angle is None:
-                    # Initialize the angle
-                    current_angle = angle_from_prvs_point
-                    last_angle = angle_from_prvs_point
-                else:
-                    # Check if the angle changes significantly, finalize the current segment if so
-                    if angle_from_prvs_point > angle_tolerance and abs(
-                            last_angle - angle_from_prvs_point) > angle_tolerance:
-                        segments.append(current_segment)
-                        segment_angles.append(last_angle)
-                        last_angle = angle_from_segment
-                        current_segment = []
-                        current_angle = angle_from_prvs_point
-
-                    # Add the current point to the segment
-                    current_segment.append(points[i])
-
-            segments.append(current_segment)
-            segment_angles.append(last_angle)
-
-            # Optimisation #1
-            for i in range(1, len(segments)):
-                if abs(segment_angles[i] - segment_angles[i - 1]) < angle_tolerance:
-                    segments[i - 1] += segments[i]
-                    segments[i] = []
-
-            for i in range(len(segments) - 1):
-                if len(segments[i]) == 0:
-                    segments.pop(i)
-                    segment_angles.pop(i)
-
-            return segments
+            simplified = _rdp(points, epsilon)
+            return [(simplified[i], simplified[i + 1]) for i in range(len(simplified) - 1)]
 
         def trace_segments(segments):
             """
@@ -242,6 +298,8 @@ class ObstacleAvoidance:
                 vectorized_points.append(segment[-1])
             return vectorized_points
 
+        padding_nodes = int(padding_meters // self.observation_space.node_spacing)
+
         source_pos = last_observation.origin
         target_waypoint = self.waypoints[self.waypoint_idx]
         target_pos = self.observation_space.geo_offset(self.observation_space.geo_origin["lat"],
@@ -254,38 +312,69 @@ class ObstacleAvoidance:
 
         self.webapp.set_working_grid(working_grid)
 
-        source_node = working_grid.index_pos(source_pos)
-        target_node = working_grid.index_pos(target_pos)
+        source_node = working_grid.index_by_pos(source_pos)
+        target_node = working_grid.index_by_pos(target_pos)
 
-        path = find_path(working_grid, source_node, target_node, avoid_occlusion=False, padding_distance=padding)
+        global PATH_IDX
+        if not os.path.exists(f"activations/observation_{PATH_IDX}/"):
+            os.makedirs(f"activations/observation_{PATH_IDX}/")
+
+        path = find_path(working_grid, source_node, target_node, avoid_occlusion=avoid_occlusion,
+                         padding_distance=padding_nodes,
+                         savename=f"activations/observation_{PATH_IDX}/observation_graph.png")
         if not path["path"]:
             return None
 
-        if path["occlusions"]:
-            first_occluded_node = path["occlusions"][0]
-            stop_pos_index = (max(0, path["path"].index(first_occluded_node) - padding))
+        if path["occluded_nodes"]:
+            stop_node = path["occluded_nodes"][0]
+            stop_idx = max(0, path["path"].index(stop_node))
+            full_path = False
         else:
-            stop_pos_index = len(path["path"])
-
-        path_segments = vectorise(path["path"][:stop_pos_index])
-        path_points = trace_segments(path_segments)
-
-        if target_node in path_points:
+            stop_idx = len(path["path"]) - 1
+            path["occlusion_angles"] = [0]
             self.waypoint_idx += 1
             full_path = True
-        else:
-            full_path = False
 
-        path_geo = [
-            working_grid.geo_compute(self.observation_space.geo_origin["lat"], self.observation_space.geo_origin["lat"],
-                                     point[0], point[1])
-            for point in path_points]
-        path_geo = [{"lat": point[0], "lon": point[1]} for point in path_geo]
-        path_heading = calculate_angle(path_geo[0], path_geo[-1])
+        if stop_idx > 1:
+            path_segments = vectorise(path["path"][:stop_idx])
+            path_points = trace_segments(path_segments)
+
+            if len(path_points) <= 1:
+                path_points = [path["path"][0], path["path"][0]]
+
+            working_grid.visualize_path(path["path"][:stop_idx],
+                                        f"activations/observation_{PATH_IDX}/working_grid_path_{PATH_IDX}")
+            PATH_IDX += 1
+
+            path_geo = [
+                self.observation_space.geo_compute(self.observation_space.geo_origin["lat"],
+                                                   self.observation_space.geo_origin["lon"],
+                                                   working_grid.get_pos(point)[0], working_grid.get_pos(point)[1])
+                for point in path_points]
+            path_geo = [{"lat": point[0], "lon": point[1]} for point in path_geo]
+            path_heading = path["occlusion_angles"][0]
+
+        else:
+            path_points = [path["path"][0], path["path"][0]]
+
+            working_grid.visualize_path(path_points,
+                                        f"activations/observation_{PATH_IDX}/working_grid_path_{PATH_IDX}")
+
+            PATH_IDX += 1
+
+            path_geo = [self.observation_space.geo_compute(self.observation_space.geo_origin["lat"],
+                                                           self.observation_space.geo_origin["lon"],
+                                                           working_grid.get_pos(path_points[0])[0],
+                                                           working_grid.get_pos(path_points[0])[1])]
+            path_geo = path_geo + path_geo
+
+            path_geo = [{"lat": point[0], "lon": point[1]} for point in path_geo]
+            path_heading = path["occlusion_angles"][0]
+
 
         out_path = {
             "path_nodes": path_points,
-            "path_pos": [working_grid.index_pos(point) for point in path_points],
+            "path_pos": [working_grid.get_pos(point) for point in path_points],
             "path_geo": path_geo,
             "path_heading": path_heading,
             "full_path": full_path
@@ -300,10 +389,12 @@ class ObstacleAvoidance:
         Args:
         - path (dict): Path information.
         """
-        for point in path["path_geo"]:
-            self.observation_space.drone.goto(point["lat"], point["lon"])
+        for point in path["path_geo"][1:]:
+            waypoint = Waypoint(point["lat"], point["lon"], self.observation_space.altitude_origin,
+                                path['path_heading'])
+            self.observation_space.drone.goto(waypoint, hold_time=0, velocity=.2)
 
-    async def loop(self, downtime_sec: int, padding: int = 7) -> None:
+    async def loop(self, downtime_sec: int, padding: int = .6) -> None:
         """
         Starts the obstacle avoidance operation loop.
 
@@ -312,18 +403,23 @@ class ObstacleAvoidance:
         - padding (int): Padding distance for obstacle avoidance.
         """
 
-        self.webapp = WebApp(waypoints=self.waypoints, observation_space=self.observation_space)
+        self.webapp = WebApp(self.waypoints, self.observation_space, None)
         self.webapp.run()
-        while not self.break_flag or self.waypoint_idx < len(self.waypoints):
-            observations = self.observe()
-            last_path = None
+        last_path = None
+        while self.waypoint_idx < len(self.waypoints) and not self.break_flag:
+            print("Observing\n")
+            observations, _ = self.observe()
             for idx, observation in enumerate(observations):
+                print("Mapping observation\n")
+                self.observation_space.add(observation)
+                print("Checking for activation\n")
                 activation, path = self.check_activation(observation, padding)
                 if activation == 0:
+                    print("Direct path found\n")
                     last_path = path
                     break
                 elif activation == 1:
-                    self.observation_space.add(observation)
+                    print("Pathing\n")
                     path = self.path_next(observation, padding)
                     if path and path["full_path"]:
                         self.follow_path(path)
@@ -332,12 +428,29 @@ class ObstacleAvoidance:
                     elif path:
                         last_path = path
                     else:
-                        self.waypoint_idx += 1  # Move to next waypoint if this one is inaccessible
+                        if last_path:
+                            last_path = {
+                                "path_nodes": [last_path["path_nodes"][-1], last_path["path_nodes"][-2]],
+                                "path_pos": [last_path["path_pos"][-1], last_path["path_pos"][-2]],
+                                "path_geo": [last_path["path_geo"][-1], last_path["path_geo"][-2]],
+                                "path_heading": path["path_heading"] if path and path["path_heading"] else last_path[
+                                    "path_heading"],
+                                "full_path": last_path["full_path"],
+                                "repeated": True
+                            }
+                            break
+                        else:
+                            "Moving to next waypoint\n"
+                            self.waypoint_idx += 1  # Move to next waypoint if this one is inaccessible
                 else:
+                    print("Blocked waypoint\n continuing...\n")
                     self.waypoint_idx += 1
                     break
             if last_path:
+                print("Following path\n")
                 self.follow_path(last_path)
+                if "repeated" in last_path.keys() and last_path["repeated"] == True:
+                    last_path = None
             else:
                 self.follow_path({"path_geo": {"lat": self.waypoints[self.waypoint_idx].lat,
                                                "lon": self.waypoints[self.waypoint_idx].lon}})
@@ -345,6 +458,7 @@ class ObstacleAvoidance:
             time.sleep(downtime_sec)
             while self.pause_execution:
                 time.sleep(1)
+
 
     def start(self, downtime_sec: int) -> None:
         asyncio.run(self.loop(downtime_sec))
@@ -360,6 +474,13 @@ class ObstacleAvoidance:
         Pauses the operation loop.
         """
         self.pause_execution = True
+
+    def drone(self) -> DroneExtended:
+        """
+        Returns the drone object from the observation space
+        Returns: DroneExtended
+        """
+        return self.observation_space.drone
 
     def save_env(self, env_name: str) -> None:
         """
@@ -381,3 +502,4 @@ class ObstacleAvoidance:
         with open(f"{env_name}.json", "r") as f:
             data = json.load(f)
             self.observation_space = ObservationSpace(**data)
+

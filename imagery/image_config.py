@@ -29,7 +29,7 @@ class ImageConfig:
     ):
         self.resolution = resolution
         self.fps = fps
-        self.horizontal_fov = horisontal_fov
+        self.horisontal_fov = horisontal_fov
         self.vertical_fov = vertical_fov
         self.img_type = img_type
         self.endpoint = endpoint

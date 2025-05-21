@@ -23,7 +23,8 @@ class ConnectionConfig:
             baud: int = 115200,
             source_system: int = 255,
             source_component: int = 0,
-            image_streams: Optional[ImageStreamsConfig] = None
+            image_streams: Optional[ImageStreamsConfig] = None,
+            reset_simulation: bool = False
     ):
         self.device = device
         self.type = type
@@ -31,6 +32,7 @@ class ConnectionConfig:
         self.source_system = source_system
         self.source_component = source_component
         self.image_streams = image_streams or ImageStreamsConfig()
+        self.reset_simulation = reset_simulation
 
     def add_image_stream(self, image_config):
         self.image_streams.add_image_stream(image_config)
