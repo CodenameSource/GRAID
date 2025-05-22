@@ -58,6 +58,19 @@ class ObstacleAvoidance:
 
         def create_initial_grid(grid_size, node_spacing, origin, geo_origin, proximity_threshold_mergind,
                                 padding_meters=2):
+            """
+            Helper function that creates the initial grid for the drone.
+            Args:
+                grid_size:
+                node_spacing:
+                origin:
+                geo_origin:
+                proximity_threshold_mergind:
+                padding_meters:
+
+            Returns:
+            """
+
             initial_grid = ObservationGrid(grid_size, node_spacing, origin, geo_origin, proximity_threshold_mergind)
 
             padding_nodes = int(math.ceil(padding_meters / node_spacing)) // 2
@@ -77,7 +90,8 @@ class ObstacleAvoidance:
         heading_origin = drone_location["hdg"]
         geo_origin = {"lat": drone_location["lat"], "lon": drone_location["lon"]}
         initial_grid = create_initial_grid(200, .2, (0, 0), geo_origin, 0.1, 3)
-        self.observation_space = ObservationSpace(200, .2, 0.1, [initial_grid], geo_origin, heading_origin, drone)
+        self.observation_space = ObservationSpace(200, .2, 0.1, [initial_grid], geo_origin, heading_origin,
+                                                  drone)  # Manually hardcoded with the best tested parameters
 
     def initialise_mission_waypoints(self, waypoints: [Waypoint]) -> None:
         """
@@ -198,6 +212,7 @@ class ObstacleAvoidance:
                   avoid_occlusion=False) -> dict | None:
         """
         Handles obstacle avoidance logic.
+        Generates a path to the next waypoint or subwaypoint(for exploring the environment in order to uncover potential obstacles).
 
         Args:
         - last_observation (ObservationGraph): The last observation data.

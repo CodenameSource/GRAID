@@ -33,6 +33,11 @@ class DroneExtended(Drone):
         return self.origin_grid
 
     def get_images(self):
+        """
+        High level function that generates images from the drone's sensors.
+        Returns: [{"config": ImageConfig, "images": [image]}]
+        """
+
         images = []
 
         if self.sim_mode:
@@ -78,6 +83,11 @@ class DroneExtended(Drone):
         return images
 
     def get_depth_images(self):
+        """
+        High level function that generates depth images from the drone's sensors.
+        Returns: [{"config": ImageConfig, "images": [depth_image]}]
+        """
+
         disparity_algorithm = self.disparity_algorithm
         depth_images = []
 
@@ -103,9 +113,12 @@ class DroneExtended(Drone):
 
     @staticmethod
     def compute_stereo_depth_map(view, disparity_algorithm):
+        """High level depth image generation function that processes the input from the stereo camera onboard the drone"""
         return compute_stereo_depth_map(view["images"][0], view["images"][1], view["config"].lens_distance,
                                         view["config"].focal_length, disparity_algorithm)
 
     @staticmethod
     def estimate_depth_map(image):
+        """High level depth estimation function utilising Apple Depth Pro algorithm"""
+
         return estimate_depth_map(image["images"][0], image["config"].resolution, image["config"].focal_length)

@@ -30,12 +30,13 @@ class ObservationGrid:
 
     def add_observation(self, obs_graph: "ObservationGraph") -> nx.Graph:
         """
-        Project every node from obs_graph onto this grid—both obstacles and free space.
-        Each observed node is assigned to the nearest unused grid cell (with fallback).
-        - If obs occupancy != 0, we OR its bits into the grid cell.
-        - If obs occupancy == 0 and the grid cell was unknown, we mark it free (0).
+        Adds an observation graph to the grid, merging nodes based on proximity.
 
-        Returns the updated self.graph.
+        Does this by iterating over the nodes of the observation graph and
+        matching the nodes with the lowest distance.
+
+        :param obs_graph: The observation graph to add.
+        :return: The updated grid graph.
         """
         # Build KD‑tree over grid node positions
         grid_nodes = list(self.graph.nodes)

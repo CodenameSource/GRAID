@@ -70,6 +70,13 @@ class WebApp:
         print("Web app started")
 
     def get_graph(self):
+        """
+        Endpoint to get the graph data for the current working grid.
+        Returns:
+            - nodes: List of nodes with occupancy and position
+            - edges: List of edges between nodes
+        """
+
         if self.current_working_grid is None:
             raise HTTPException(status_code=404, detail="No working grid set")
 
@@ -89,6 +96,11 @@ class WebApp:
         return {"nodes": nodes, "edges": edges}
 
     def get_waypoints(self):
+        """
+        Endpoint to get the waypoints in a format suitable for visualization.
+        Returns:
+            - waypoints: List of waypoints with id, position, and occupancy
+        """
         processed_waypoints = [{
             "id": idx,
             "position": {"lat": wp.lat, "lon": wp.lon},
@@ -100,7 +112,6 @@ class WebApp:
     def get_waypoints_graph(self):
         """
         Returns the waypoints transformed to graph coordinates.
-        (This simple transformation is for demonstration; adjust as needed.)
         """
         if self.current_working_grid is None:
             raise HTTPException(status_code=404, detail="No working grid set")
@@ -126,7 +137,11 @@ class WebApp:
     def get_working_grid_borders(self):
         """
         Returns the borders of the working grid (from the graph) in geo coordinates.
-        :return:
+        Returns:
+            - min_lat: Minimum latitude of the grid
+            - max_lat: Maximum latitude of the grid
+            - min_lon: Minimum longitude of the grid
+            - max_lon: Maximum longitude of the grid
         """
         if self.current_working_grid is None:
             raise HTTPException(status_code=404, detail="No working grid set")
@@ -149,7 +164,6 @@ class WebApp:
         """
         Change the global current node based on a node_id provided as a string,
         :param node_id:
-        :return:
         """
         if self.current_working_grid is None:
             raise HTTPException(status_code=404, detail="No working grid set")
@@ -171,6 +185,8 @@ class WebApp:
     def get_current_node_info(self):
         """
         Return the data associated with the current node.
+        Returns:
+            JSON object with node data
         """
         if self.current_working_grid is None:
             raise HTTPException(status_code=404, detail="No working grid set")
@@ -185,13 +201,15 @@ class WebApp:
         return {"node": str(self.current_node), "data": node_data}
 
     def _get_drone_info(self):
+        """Helper function to get the drone's information."""
+
         def calculate_speed(vx, vy, vz):
             return math.sqrt(vx ** 2 + vy ** 2 + vz ** 2)
 
         def speed_to_kmh(speed):
             return speed * 3.6
 
-        drone_location = self.observation_space.last_drone_location
+        drone_location = self.observation_space.last_drone_location  # A hack that caches the last acquired location due to problems with Airsim's multi-threading...
         drone_position = self.observation_space.drone_position()
 
         speed_m = calculate_speed(drone_location["vx"], drone_location["vy"], drone_location["vz"])
@@ -217,6 +235,10 @@ class WebApp:
         return self._get_drone_info()
 
     async def drone_info_connect(self, ws: WebSocket):
+        """
+        Accepts a WebSocket connection and adds it to the list of connections.
+        :param ws: WebSocket connection
+        """
         await ws.accept()
         print("WebSocket client connected")
         self.websocket_connections[ws] = asyncio.Event()
@@ -224,6 +246,10 @@ class WebApp:
         await ws.receive()
 
     async def drone_info_disconnect(self, ws: WebSocket):
+        """
+        Disconnects a WebSocket connection and removes it from the list of connections.
+        :param ws: WebSocket connection
+        """
         ev = self.websocket_connections.pop(ws, None)
         if ev:
             ev.set()
@@ -233,6 +259,10 @@ class WebApp:
         await self.drone_info_connect(ws)
 
     async def broadcast_drone_info_loop(self):
+        """
+        A broadcast loop that sends drone information to all connected WebSocket clients.
+        """
+
         while True:
             if self.current_working_grid is not None and self.current_working_grid.graph is not None and len(
                     self.websocket_connections) > 0:

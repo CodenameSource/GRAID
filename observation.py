@@ -54,6 +54,12 @@ class ObservationGraph:
         return projected_width
 
     def create_curved_fov_graph(self):
+        """
+        An alternative method for the creation of a more realistic-looking curved FOV graph.
+        Returns:
+        - graph: A NetworkX graph representing the curved field of view.
+        """
+
         _width_coeff = self.projected_image_width(self.max_depth_m) / self.projected_image_width(
             self.max_depth_m ** self.curve_scaling)
 
@@ -103,7 +109,7 @@ class ObservationGraph:
         - graph: The NetworkX graph to rotate.
         - angle_degrees: The rotation angle in degrees.
         """
-        self.rotate_graph(self.graph, angle_degrees, origin=self.origin, node_spacing=self.node_spacing)
+        self.rotate_graph(self.graph, angle_degrees, origin=self.origin)
 
     def width_at_depth(self, depth):
         """
@@ -313,7 +319,18 @@ class ObservationGraph:
         plt.savefig("observation_graph.png")
 
     @staticmethod
-    def rotate_graph(graph, rotation_degrees, origin=(0, 0), node_spacing=0.2):
+    def rotate_graph(graph, rotation_degrees, origin=(0, 0)):
+        """
+        A helper function to rotate the graph around a given origin.
+        Args:
+            graph:
+            rotation_degrees:
+            origin:
+
+        Returns:
+            graph: The rotated graph.
+        """
+
         if rotation_degrees == 0:
             new_positions = {}
             for node, (x, y) in nx.get_node_attributes(graph, 'pos').items():

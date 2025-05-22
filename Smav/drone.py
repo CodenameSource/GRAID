@@ -6,6 +6,9 @@ from Smav.control import set_mode, takeoff, land, goto, get_location, set_param,
     calculate_location_delta
 from Smav.util import Waypoint, geo_offset
 
+"""
+A simple mavlink library that provides all the necessary functions to control a drone using pymavlink and airsim.
+"""
 
 class Drone:
     def __init__(self, host, port=5760, tcp=True, simulator_mode=False, simulator_address='',
@@ -88,6 +91,17 @@ class Drone:
         land(self.master, lat, lon, landing_alt)
 
     def goto(self, waypoint: Waypoint, hold_time: int = 2, velocity: int = .25):
+        """
+        A method that moves the drone to a specified waypoint, no matter if used with a simulation or MAVLink connected vehicle.
+        Args:
+            waypoint:
+            hold_time:
+            velocity:
+
+        Returns:
+
+        """
+
         if self.sim_mode and self.simulator:
             target_ned = geo_offset(self.simulator_geo_origin.lat, self.simulator_geo_origin.lon, waypoint.lat,
                                     waypoint.lon)
@@ -96,27 +110,29 @@ class Drone:
                           self.simulator_geo_origin.alt - waypoint.alt]  # altitude inversed due to unreal engine weird ned, x and y are swapped
 
             self.simulator.rotateToYawAsync(waypoint.hdg).join()
-            # self.simulator.simSetCameraPose("0", airsim.Pose(orientation_val=airsim.euler_to_quaternion(0, 0, np.deg2rad(waypoint.hdg))))
 
             self.simulator.moveToPositionAsync(target_ned[0], target_ned[1], target_ned[2], velocity, lookahead=-1,
                                                adaptive_lookahead=1,
                                                yaw_mode=airsim.YawMode(False, waypoint.hdg)).join()
 
-            # current_drone_location = self.get_location()
-            # distance_to_waypoint = calculate_location_delta(waypoint.lat, waypoint.lon, current_drone_location['lat'],
-            #                                                current_drone_location['lon'])
-            ##self.simulator.moveToGPSAsync(waypoint.lat, waypoint.lon, waypoint.alt, velocity).join() A bug in airsim's moveToPath?
-
-            # while distance_to_waypoint > velocity * 2:
-            #    sleep(hold_time)
-            #    self.simulator.moveToGPSAsync(waypoint.lat, waypoint.lon, waypoint.alt, velocity/2).join()
-            #    current_drone_location = self.get_location()
-            #    distance_to_waypoint = calculate_location_delta(waypoint.lat, waypoint.lon, current_drone_location['lat'], current_drone_location['lon'])
-
             return
         goto(self.master, waypoint.lat, waypoint.lon, waypoint.alt, hold_time=hold_time)
 
     def get_location(self):
+        """
+        A method that returns the current location of the drone.
+        Returns: {
+            'lat': latitude,
+            'lon': longitude,
+            'alt': altitude,
+            'relative_alt': relative altitude,
+            'vx': velocity in x direction,
+            'vy': velocity in y direction,
+            'vz': velocity in z direction,
+            'hdg': heading
+        }
+        """
+
         if self.sim_mode and self.simulator:
             vehicle_state = self.simulator.getMultirotorState()
             gps_data = vehicle_state.gps_location

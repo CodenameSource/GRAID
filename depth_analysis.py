@@ -28,6 +28,7 @@ class ProjectionKernels:
 def generate_projection_images(depth_data, max_depth=10, fov_horizontal=90, fov_vertical=60):
     """
     Generates projection-level images for given depth data up to max_depth meters.
+    Each projection image captures only the important depth information that may contain possible obstacles on the drone's path
 
     Args:
         depth_data (numpy.ndarray): Normalized depth image (depth in meters).
@@ -70,6 +71,7 @@ def apply_kernels(
     """
     Partition each depth‐level image into rectangular kernels and flag those
     whose given percentile depth lies within [depth-1, depth).
+    A naive optimisation on the process of converting the depth image into usable graph information
 
     Parameters
     ----------
@@ -217,6 +219,7 @@ def map_obstacles_graph(
 ) -> ObservationGraph:
     """
     Marks graph nodes as obstacles wherever a kernel is activated.
+    Transfers the processed depth information to a temporary cone-like graph.
 
     Parameters
     ----------
